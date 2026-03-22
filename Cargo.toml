@@ -1,0 +1,12 @@
+[package]
+name = "slatestreams"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+blake3 = "1.8.3"
+bytes = "1.11.1"
+enum-ordinalize = "4.3.2"
+slatedb = "0.11.2"
+thiserror = "2.0.18"
+tokio = { version = "1.50.0", features = ["macros"] }
