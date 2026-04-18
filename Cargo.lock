@@ -2585,6 +2585,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "slatestreams-server"
+version = "0.1.0"
+dependencies = [
+ "slatestreams",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
