@@ -1,48 +1,25 @@
-use slatedb::bytes::Bytes;
-use slatedb::{Db, Error, object_store::memory::InMemory};
-use std::sync::Arc;
-use std::time::{SystemTime};
+use std::{net::SocketAddr, sync::Arc};
 
-struct Record {
-    seq_num: u64,
-    timestamp: SystemTime,
-    header: &'static[(Bytes, Bytes)],
-    body: Bytes,
-}
-
-struct Stream {
-    uri: String,
-    head: Option<Record>,
-    tail: Option<Record>,
-}
-
-struct Namespace {
-    uri: String,
-}
-
-struct StreamManager {
-}
+use slatestreams::{
+    grpc::GrpcStreamService, pb::slatestreams::v1::stream_service_server::StreamServiceServer,
+    storage::in_memory::InMemoryStorage, stream_controller::StreamController,
+};
+use tonic::transport::Server;
 
 #[tokio::main]
-async fn main() -> Result<(), Error> {
-    // Setup
-    let object_store = Arc::new(InMemory::new());
-    let kv_store = Db::open("/tmp/slatedb_full_example", object_store).await?;
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let addr: SocketAddr = "127.0.0.1:50051".parse()?;
+    let meta_storage = Arc::new(InMemoryStorage::new());
+    let record_storage = Arc::new(InMemoryStorage::new());
+    let controller = Arc::new(StreamController::new(meta_storage, record_storage));
+    let service = GrpcStreamService::new(controller);
 
-    // Append
-    //
-    // Get/Create streamer client instance for stream
-    // In-memory concurrent map <StreamID, StreamerClientSlot>
-    // enum StreamerClientSlot {
-      // Initializing { init_id, future },  // startup in progress
-      // Ready { client: StreamerClient },  // actor running
-    // }
-    // StreamerClient is initialised async
-    // Subsequent calls to same stream share that same slot
-    //
-    // Semaphore
-    //
-    // 
+    println!("slatestreams gRPC server listening on {addr}");
+
+    Server::builder()
+        .add_service(StreamServiceServer::new(service))
+        .serve(addr)
+        .await?;
 
     Ok(())
 }
