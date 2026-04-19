@@ -1,0 +1,29 @@
+[package]
+name = "slatestreams-workload"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+antithesis_sdk = "0.2.8"
+bytes = "1.11.1"
+serde_json = "1"
+slatestreams = { path = "../slatestreams" }
+tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "time", "signal"] }
+tokio-stream = "0.1.17"
+tonic = "0.14.5"
+
+[[bin]]
+name = "first_init"
+path = "src/first_init.rs"
+
+[[bin]]
+name = "parallel_driver_append_read"
+path = "src/parallel_driver_append_read.rs"
+
+[[bin]]
+name = "writer"
+path = "src/writer.rs"
+
+[[bin]]
+name = "reader"
+path = "src/reader.rs"

@@ -1,0 +1,14 @@
+[package]
+name = "slatestreams-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+slatestreams = { path = "../slatestreams" }
+tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "time"] }
+tokio-stream = "0.1.17"
+tonic = "0.14.5"
+
+[[bin]]
+name = "slatestreams-client"
+path = "src/main.rs"
