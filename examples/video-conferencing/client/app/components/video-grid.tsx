@@ -25,17 +25,13 @@ export function VideoGrid({ localVideoRef, peers }: VideoGridProps) {
         </span>
       </div>
 
-      {/* Remote peers */}
+      {/* Remote peers — fed via MediaSource objectUrl */}
       {Array.from(peers.values()).map((peer) => (
         <div key={peer.id} className="relative rounded-lg overflow-hidden bg-zinc-900">
           <video
             autoPlay
             playsInline
-            ref={(el) => {
-              if (el && el.srcObject !== peer.stream) {
-                el.srcObject = peer.stream;
-              }
-            }}
+            src={peer.objectUrl}
             className="h-full w-full object-cover"
           />
           <span className="absolute bottom-2 left-2 rounded bg-black/60 px-2 py-1 text-xs">

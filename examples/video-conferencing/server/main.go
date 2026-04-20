@@ -3,27 +3,21 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"sync"
 
+	pb "video-conferencing/gen/slatestreams/v1"
+	"video-conferencing/model"
+
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	pb "video-conferencing/gen/slatestreams/v1"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
-
-// SignalingMessage is the envelope for all WebRTC signaling exchanged through SlateStreams.
-type SignalingMessage struct {
-	Type     string          `json:"type"`               // join, offer, answer, ice-candidate, leave
-	SenderID string          `json:"sender_id"`
-	TargetID string          `json:"target_id,omitempty"`
-	RoomID   string          `json:"room_id,omitempty"`
-	Payload  json.RawMessage `json:"payload,omitempty"`
-}
 
 // Participant is a connected browser client.
 type Participant struct {
@@ -69,14 +63,102 @@ func main() {
 		},
 	}
 
-	http.HandleFunc("/ws", srv.handleWebSocket)
+	http.HandleFunc("/signal", srv.handleSignaling)
+	http.HandleFunc("/ws", srv.handleMediaStream)
 
 	log.Printf("listening on %s  (SlateStreams: %s)", listenAddr, grpcAddr)
 	log.Fatal(http.ListenAndServe(listenAddr, nil))
 }
 
-// handleWebSocket upgrades the HTTP connection and manages a single participant.
-func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+// handleSignaling is a plain HTTP POST endpoint for join/leave messages.
+// Returns the assigned participant ID on join so the client can use it for media frames.
+func (s *Server) handleSignaling(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "could not read body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	var msg model.Message
+	if err := json.Unmarshal(body, &msg); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if err := msg.Valid(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	switch msg.Type {
+	case model.JOIN:
+		participantID := uuid.New().String()
+		// We don't have a WebSocket yet — register a placeholder participant.
+		// The real Conn gets set when they connect to /ws.
+		p := &Participant{
+			ID:   participantID,
+			Room: msg.RoomID,
+		}
+		s.joinRoom(r.Context(), msg.RoomID, p)
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"participant_id": participantID,
+			"room_id":        msg.RoomID,
+		})
+
+	case model.LEAVE:
+		s.mu.RLock()
+		room, found := s.rooms[msg.RoomID]
+		s.mu.RUnlock()
+		if found {
+			room.mu.RLock()
+			p, exists := room.Participants[msg.SenderID]
+			room.mu.RUnlock()
+			if exists {
+				s.leaveRoom(p)
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+
+	default:
+		http.Error(w, "unsupported message type", http.StatusBadRequest)
+	}
+}
+
+// handleMediaStream upgrades to WebSocket for binary media frames only.
+// The client must pass participant_id and room_id as query params (obtained from POST /signal).
+func (s *Server) handleMediaStream(w http.ResponseWriter, r *http.Request) {
+	participantID := r.URL.Query().Get("participant_id")
+	roomID := r.URL.Query().Get("room_id")
+	if participantID == "" || roomID == "" {
+		http.Error(w, "participant_id and room_id query params required", http.StatusBadRequest)
+		return
+	}
+
+	// Look up the participant created during /signal join.
+	s.mu.RLock()
+	room, roomFound := s.rooms[roomID]
+	s.mu.RUnlock()
+	if !roomFound {
+		http.Error(w, "room not found", http.StatusNotFound)
+		return
+	}
+
+	room.mu.RLock()
+	participant, pFound := room.Participants[participantID]
+	room.mu.RUnlock()
+	if !pFound {
+		http.Error(w, "participant not found — call POST /signal with join first", http.StatusNotFound)
+		return
+	}
+
 	ws, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("upgrade error: %v", err)
@@ -84,18 +166,65 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer ws.Close()
 
-	participant := &Participant{
-		ID:   uuid.New().String(),
-		Conn: ws,
-	}
+	// Attach the WebSocket connection to the participant.
+	participant.mu.Lock()
+	participant.Conn = ws
+	participant.mu.Unlock()
 
-	_ = participant // TODO: read messages, join/leave rooms, relay signaling
+	log.Printf("participant %s connected media stream for room %s", participantID, roomID)
+
+	// Read loop — binary media frames only.
+	for {
+		msgType, data, err := ws.ReadMessage()
+		if err != nil {
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				log.Printf("participant %s media stream closed", participantID)
+			} else {
+				log.Printf("media read error for %s: %v", participantID, err)
+			}
+			break
+		}
+
+		if msgType != websocket.BinaryMessage {
+			continue
+		}
+
+		s.handleMediaFrame(participant, data)
+	}
 }
 
-// joinRoom adds a participant to a room, creating it and starting the stream
-// follower if it doesn't exist yet.
-func (s *Server) joinRoom(roomID string, p *Participant) {
-	// TODO: create room if needed, start SlateStreams Read follower, add participant
+// handleMediaFrame processes a binary media frame (SLAT-prefixed).
+func (s *Server) handleMediaFrame(p *Participant, data []byte) {
+	frame, err := model.ParseMediaFrame(data)
+	if err != nil {
+		log.Printf("invalid media frame from %s: %v", p.ID, err)
+		return
+	}
+
+	_ = frame // TODO: append frame.Media to SlateStreams stream for this participant
+}
+
+// joinRoom adds a participant to a room, creating it if it doesn't exist yet.
+func (s *Server) joinRoom(ctx context.Context, roomID string, p *Participant) {
+	s.mu.Lock()
+	room, found := s.rooms[roomID]
+	if !found {
+		roomCtx, cancel := context.WithCancel(context.Background())
+		room = &Room{
+			ID:           roomID,
+			Participants: make(map[string]*Participant),
+			cancel:       cancel,
+		}
+		s.rooms[roomID] = room
+		go s.followRoom(roomCtx, room)
+	}
+	s.mu.Unlock()
+
+	room.mu.Lock()
+	room.Participants[p.ID] = p
+	room.mu.Unlock()
+
+	log.Printf("participant %s joined room %s", p.ID, roomID)
 }
 
 // leaveRoom removes a participant and tears down the room when empty.
@@ -103,20 +232,9 @@ func (s *Server) leaveRoom(p *Participant) {
 	// TODO: remove participant, cancel follower if last one out
 }
 
-// appendSignal publishes a signaling message to the room's SlateStreams stream.
-func (s *Server) appendSignal(ctx context.Context, roomID string, msg SignalingMessage) error {
-	// TODO: marshal msg, call s.client.Append with basin=s.basin, stream="room-"+roomID
-	return nil
-}
-
-// followRoom reads the room's stream and fans out messages to participants.
+// followRoom reads the room's stream and fans out media to participants.
 func (s *Server) followRoom(ctx context.Context, room *Room) {
-	// TODO: call s.client.Read (streaming), unmarshal each record, send to participants via WebSocket
-}
-
-// broadcast sends a signaling message to all participants in a room except the sender.
-func (s *Server) broadcast(room *Room, msg SignalingMessage) {
-	// TODO: iterate room.Participants, skip sender, write JSON to websocket
+	// TODO: call s.client.Read (streaming), relay binary frames to participants via WebSocket
 }
 
 func envOr(key, fallback string) string {
