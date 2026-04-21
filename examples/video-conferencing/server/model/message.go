@@ -19,7 +19,7 @@ type Message struct {
 }
 
 func (m Message) Valid() error {
-	if isValidType(m.Type) {
+	if !isValidType(m.Type) {
 		return fmt.Errorf("invalid message type: %s", m.Type)
 	}
 

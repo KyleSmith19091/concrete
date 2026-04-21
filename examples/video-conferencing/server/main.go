@@ -201,7 +201,16 @@ func (s *Server) handleMediaFrame(p *Participant, data []byte) {
 		return
 	}
 
-	_ = frame // TODO: append frame.Media to SlateStreams stream for this participant
+	// Append the full binary frame (header + media) to the room's stream.
+	// Using the raw data preserves the SLAT header so followRoom can decode sender.
+	_, err = s.client.Append(context.Background(), &pb.AppendRequest{
+		BasinName:  s.basin,
+		StreamName: p.Room,
+		Data:       data,
+	})
+	if err != nil {
+		log.Printf("append error for %s (frame type %d): %v", p.ID, frame.FrameType, err)
+	}
 }
 
 // joinRoom adds a participant to a room, creating it if it doesn't exist yet.
@@ -229,12 +238,89 @@ func (s *Server) joinRoom(ctx context.Context, roomID string, p *Participant) {
 
 // leaveRoom removes a participant and tears down the room when empty.
 func (s *Server) leaveRoom(p *Participant) {
-	// TODO: remove participant, cancel follower if last one out
+	roomID := p.Room
+
+	s.mu.RLock()
+	room, found := s.rooms[roomID]
+	s.mu.RUnlock()
+	if !found {
+		return
+	}
+
+	// Close the participant's WebSocket if still open.
+	p.mu.Lock()
+	if p.Conn != nil {
+		p.Conn.Close()
+		p.Conn = nil
+	}
+	p.mu.Unlock()
+
+	// Remove from room.
+	room.mu.Lock()
+	delete(room.Participants, p.ID)
+	remaining := len(room.Participants)
+	room.mu.Unlock()
+
+	log.Printf("participant %s left room %s (%d remaining)", p.ID, roomID, remaining)
+
+	// If the room is now empty, cancel the follower and clean up.
+	if remaining == 0 {
+		room.cancel()
+		s.mu.Lock()
+		delete(s.rooms, roomID)
+		s.mu.Unlock()
+		log.Printf("room %s closed (empty)", roomID)
+	}
 }
 
 // followRoom reads the room's stream and fans out media to participants.
 func (s *Server) followRoom(ctx context.Context, room *Room) {
-	// TODO: call s.client.Read (streaming), relay binary frames to participants via WebSocket
+	stream, err := s.client.Read(ctx, &pb.ReadRequest{
+		BasinName:  s.basin,
+		StreamName: room.ID,
+		StartSeqNum: 0,
+	})
+	if err != nil {
+		log.Printf("followRoom %s: failed to open read stream: %v", room.ID, err)
+		return
+	}
+
+	for {
+		rec, err := stream.Recv()
+		if err != nil {
+			if ctx.Err() != nil {
+				log.Printf("followRoom %s: context cancelled, stopping", room.ID)
+			} else {
+				log.Printf("followRoom %s: recv error: %v", room.ID, err)
+			}
+			return
+		}
+
+		// Decode the sender so we can skip echoing back to them.
+		if !model.IsMediaFrame(rec.Data) {
+			continue
+		}
+		frame, err := model.ParseMediaFrame(rec.Data)
+		if err != nil {
+			continue
+		}
+
+		// Fan out to every participant except the sender.
+		room.mu.RLock()
+		for _, p := range room.Participants {
+			if p.ID == frame.SenderID {
+				continue
+			}
+			p.mu.Lock()
+			if p.Conn != nil {
+				if err := p.Conn.WriteMessage(websocket.BinaryMessage, rec.Data); err != nil {
+					log.Printf("followRoom %s: write to %s failed: %v", room.ID, p.ID, err)
+				}
+			}
+			p.mu.Unlock()
+		}
+		room.mu.RUnlock()
+	}
 }
 
 func envOr(key, fallback string) string {
